@@ -35,6 +35,8 @@ R_SHIFT = 7.96     # KiCad right half -> right case (matches the right top's scr
 SCREWS = {'L': [(57, -52.7), (34.3, -121.014348), (139.5, -112), (131.2, -52.7)]}
 SCREWS['R'] = [(168.46, -112.0), (176.76, -52.7), (250.96, -52.7), (273.66, -121.0)]
 XIAO = {'L': ((41.2, -59.6), 90.0), 'R': ((258.8 + R_SHIFT, -59.6), -90.0)}
+FLAT = '--flat' in sys.argv   # no leg recesses: flat underside; builds the bottom only
+SUF = '_flat' if FLAT else ''
 OUT = W.parent / 'outputs'
 OUT.mkdir(exist_ok=True)
 T0 = time.monotonic()
@@ -577,6 +579,36 @@ def validate_step(shape, path):
     raise AssertionError((path.name, tried))
 
 
+def fill_recesses_flat(bot, side):
+    """--flat: fill the two leg (tenting) recesses up to the flat underside (z=-11.4), so the
+    bottom has no leg recesses. The roof faces at -7.3 give each recess outline; the fill stays
+    inside the part's own footprint and leaves a 3 mm-radius cavity around each screw (the
+    screw-head counterbore, now 4.1 mm deep) exactly as the recess did."""
+    import shapely.geometry as sg
+    from shapely.ops import unary_union
+    roof_faces = [f for f in bot.Faces() if f.normalAt().z < -0.99 and abs(f.Center().z + 7.3) < 0.02 and f.Area() > 200]
+    roof = unary_union([face_poly(f) for f in roof_faces])
+    foot = unary_union([face_poly(f) for f in bot.Faces() if f.normalAt().z < -0.5 and f.Area() > 1]).buffer(-1e-4)
+    screws = unary_union([sg.Point(x, y).buffer(3.0) for x, y in SCREWS[side]])
+    # overshoot the recess outline (overlap into its walls, out past the part's edge at the mouths),
+    # fuse, then trim whatever stuck out past the footprint: coincident faces against the faceted
+    # side walls make the fuse unreliable, the trim against a clean prism is not
+    area = roof.buffer(0.15).difference(screws).simplify(0.02)
+    pieces = [g for g in (area.geoms if area.geom_type == 'MultiPolygon' else [area]) if g.area > 0.3]
+    fill = [cq.Solid.extrudeLinear(poly_face(g, -11.4), cq.Vector(0, 0, 11.4 - 7.0)) for g in pieces]
+    out = bot.fuse(*fill).clean()
+    rim = roof.buffer(1.0).difference(foot.buffer(1e-4)).difference(roof.buffer(-0.5))
+    trim = [cq.Solid.extrudeLinear(poly_face(g, -11.5), cq.Vector(0, 0, 4.6))
+            for g in (rim.geoms if rim.geom_type == 'MultiPolygon' else [rim]) if g.area > 0.01]
+    if trim:
+        out = out.cut(*trim).clean()
+    assert out.isValid() and len(out.Solids()) == 1, 'flat fill is not one valid solid'
+    b0, b1 = bot.BoundingBox(), out.BoundingBox()
+    assert max(abs(getattr(b0, a) - getattr(b1, a)) for a in ('xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax')) < 1e-3, \
+        'flat fill reached outside the case'
+    return out, len(pieces), round(area.area, 1)
+
+
 def build(side, parts):
     log(side, 'start')
     top = load(f'orig/TOTEM_case_ble_top_{side}_V.08.step')
@@ -585,6 +617,9 @@ def build(side, parts):
     log(side, 'leg-recess slits closed:', n_slit, 'pieces,', a_slit, 'mm^2 footprint,', v_fill, 'mm^3')
     bot, n_open, a_open = close_recess_openings(bot, side, top)
     log(side, 'through-openings in the recess roofs closed:', n_open, ',', a_open, 'mm^2')
+    if FLAT:
+        bot, n_flat, a_flat = fill_recesses_flat(bot, side)
+        log(side, 'leg recesses filled flat:', n_flat, 'pieces,', a_flat, 'mm^2')
     pcb = pcb_solid(side)
     k_pcb, n_holes, n_kept = pcb_keepout(pcb)
     log(side, 'pcb keep-out ok; holes', n_holes, 'kept after shrink', n_kept)
@@ -606,6 +641,14 @@ def build(side, parts):
     # the bottom rim grows up by SEAM_RAISE under the old skirt footprint (old gap filled, new gap kept)
     ring = top.intersect(box(-50, 450, -300, 50, SEAM_Z0, seam - SEAM_GAP))
     skirt = ring.fuse(ring.translate(cq.Vector(0, 0, -SEAM_GAP - 0.05))).clean()
+    if FLAT:   # bottom only, with the leg recesses filled
+        nb = fast_cut(bot.fuse(skirt).clean(), tools).clean()
+        sb = sorted(nb.Solids(), key=lambda x: -x.Volume())
+        log(side, 'flat bottom solids', [round(x.Volume(), 2) for x in sb][:5])
+        nb = drop_voids(sb[0])
+        log(side, 'flat bottom in-memory valid:', nb.isValid(), 'volume', round(nb.Volume(), 1))
+        validate_step(nb, OUT / f'TOTEM_alu_bottom_flat_{side}.step')
+        return None
     bosses = [top.intersect(cq.Solid.makeCylinder(PAD_R, PCB_TOP + C + 0.2, cq.Vector(sx, sy, PCB_TOP)))
               for sx, sy in SCREWS[side]]
     new_top = fast_cut(top_hi, tools)
